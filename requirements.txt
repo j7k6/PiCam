@@ -1,0 +1,8 @@
+Pillow
+RPi.GPIO
+opencv-python
+email
+picamera
+pyyaml
+smtplib
+ssl

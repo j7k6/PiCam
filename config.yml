@@ -1,0 +1,29 @@
+config:
+  base:
+    data_dir: "/mnt/data"
+    wait_time: 10
+    ffmpeg_path: "/usr/bin/ffmpeg"
+  gpio:
+    ir_led_pin: 23
+    motion_sensor_pin: 24
+    modem_power_trigger_pin: 26
+    modem_power_status_pin: 19
+    low_battery_pin: 17
+  camera:
+    rotation: 0
+    photo_res: [1600, 1200]
+    preview_res: [640, 480]
+    video_max_length: 30
+    video_thumbnails_num: 9
+  modem:
+    ppp_call_command: "/usr/sbin/pppd call gprs"
+    ppp_timeout: 20
+  smtp:
+    server: ""
+    port: 587
+    starttls: True
+    username: ""
+    password: ""
+    to: ""
+    from: ""
+
