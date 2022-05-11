@@ -21,7 +21,7 @@ import time
 import yaml
 
 
-with open("config.yml") as stream:
+with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "config.yml")) as stream:
     try:
         config = yaml.safe_load(stream)["config"]
     except yaml.YAMLError as e:
