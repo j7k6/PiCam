@@ -1,48 +1,106 @@
 #!/usr/bin/env python3
 
+import sys
+
+if sys.stdout.isatty():
+    print("Loading PiCam...")
+
 from PIL import Image
 from email import encoders
+from email.header import Header
+from email.mime.application import MIMEApplication
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from io import BytesIO
+from logging.handlers import SysLogHandler
+from pathlib import Path
+from spidev import SpiDev
 import RPi.GPIO as GPIO
 import cv2
 import datetime
 import logging
+import logging.handlers
 import math
+import numpy as np
 import os
 import picamera
+import picamera.array
+import psutil
+import signal
 import smtplib
 import ssl
 import subprocess
-import sys
+import tempfile
 import time
-import yaml
+
+from config import *
 
 
-with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "config.yml")) as stream:
-    try:
-        config = yaml.safe_load(stream)["config"]
-    except yaml.YAMLError as e:
-        logging.fatal(e)
+""" Logging Setup """
+logger = logging.getLogger("picam")
+logger.setLevel(logging.DEBUG)
+
+if sys.stdout.isatty():
+    logging.getLogger("PIL").setLevel(logging.CRITICAL+1)
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler = logging.StreamHandler(sys.stderr)
+else:
+    formatter = logging.Formatter("[%(name)s] %(levelname)s %(message)s")
+    handler = logging.handlers.SysLogHandler(address="/dev/log")
+    handler.setLevel(logging.INFO)
+
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 
 """ GPIO Setup """
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
-GPIO.setup(config["gpio"]["ir_led_pin"], GPIO.OUT)
-GPIO.setup(config["gpio"]["motion_sensor_pin"], GPIO.IN)
-GPIO.setup(config["gpio"]["modem_power_status_pin"], GPIO.IN)
-GPIO.setup(config["gpio"]["modem_power_trigger_pin"], GPIO.OUT)
-GPIO.setup(config["gpio"]["low_battery_pin"], GPIO.IN)
+GPIO.setup(IR_LED_PIN, GPIO.OUT)
+GPIO.setup(MOTION_SENSOR_PIN, GPIO.IN)
+GPIO.setup(MODEM_POWER_PIN, GPIO.OUT)
 
-""" PCamera Setup """
-camera = picamera.PiCamera()
-camera.rotation = config["camera"]["rotation"]
-camera.color_effects = (128, 128)
-camera.annotate_background = picamera.Color('black')
-camera.annotate_foreground = picamera.Color('white')
+last_motion_time = time.time()
+motion_count = 0
+false_alarm_count = 0
+
+
+# https://picamera.readthedocs.io/en/release-1.13/api_array.html#pimotionanalysis
+class DetectMotion(picamera.array.PiMotionAnalysis):
+    def analyze(self, a):
+        global last_motion_time
+        global motion_count
+
+        a = np.sqrt(np.square(a["x"].astype(np.float)) + np.square(a["y"].astype(np.float))).clip(1, 255).astype(np.uint8)
+
+        if (a > MOTION_MAGNITUDE_MIN).sum() > MOTION_VECTORS_MIN:
+            last_motion_time = time.time()
+            motion_count += 1
+            logger.debug(f"Motion detected! Motion count: {motion_count}")
+
+
+class MCP3008:
+    def __init__(self, bus = 0, device = 0):
+        self.bus, self.device = bus, device
+        self.spi = SpiDev()
+        self.open()
+        self.spi.max_speed_hz = 1000000
+
+    def open(self):
+        self.spi.open(self.bus, self.device)
+        self.spi.max_speed_hz = 1000000
+
+    def read(self, channel = 0):
+        cmd1 = 4 | 2 | (( channel & 4) >> 2)
+        cmd2 = (channel & 3) << 6
+
+        adc = self.spi.xfer2([cmd1, cmd2, 0])
+        data = ((adc[1] & 15) << 8) + adc[2]
+        return data
+
+    def close(self):
+        self.spi.close()
 
 
 class PPP:
@@ -51,15 +109,14 @@ class PPP:
         self.connected = False
 
     def connect(self):
-        self.proc = subprocess.Popen(config["modem"]["ppp_call_command"].split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        start_time = time.time()
+        self.proc = subprocess.Popen(PPP_CALL_COMMAND.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        for i in range(config["modem"]["ppp_timeout"]):
+        while (time.time() - start_time) < PPP_TIMEOUT:
             with open("/proc/net/dev") as fp:
                 for line in fp:
                     if line.split()[0].startswith("ppp0") and int(line.split()[2]) > 0:
                         self.connected = True
-
-            time.sleep(1)
 
             if self.connected:
                 break
@@ -71,31 +128,91 @@ class PPP:
             pass
 
         try:
-            os.remove("/var/lock/LCK..ttyAMA0")
+            os.remove("/var/lock/LCK..serial0")
         except Exception as e:
             pass
 
-
-def generate_video_thumbnails(video_path, video_thumbnails_path):
-    video_thumbnails_generated = False
+def graceful_exit(signum=None, frame=None):
+    logger.info("Exiting...")
 
     try:
-        cap = cv2.VideoCapture(video_path)
+        toggle_modem_power(0)
+    except:
+        pass
+    try:
+        GPIO.output(IR_LED_PIN, GPIO.LOW)
+    except:
+        pass
+    try:
+        camera.close()
+    except:
+        pass
+    try:
+        GPIO.cleanup()
+    except:
+        pass
+
+    sys.exit(0)
+
+
+def get_battery_voltage():
+    adc = MCP3008()
+
+    v = []
+
+    for i in range(10):
+        v.append(adc.read(0) / 1023 * 1.165)
+        time.sleep(0.1)
+
+    adc.close()
+
+    v_cur = sum(v) / len(v)
+    v_per = float(((v_cur - VOLTAGE_MIN) / (VOLTAGE_MAX - VOLTAGE_MIN)) * 100)
+
+    if v_per > 100:
+        v_per = 100.0
+    if v_per < 0:
+        v_per = 0.0
+
+    return v_cur, v_per
+
+
+def get_cpu_temp():
+    with open("/sys/class/thermal/thermal_zone0/temp") as f:
+        return float(int(f.readline()) / 1000)
+
+
+def get_disk_usage():
+    return psutil.disk_usage(DATA_DIR).percent
+
+
+def log_stats():
+    v_cur, v_per = get_battery_voltage()
+    return f"CPU Temp: {get_cpu_temp():.2f}°C, Battery: {v_cur:.2f}V ({v_per:.2f}%), Disk: {get_disk_usage():.2f}%"
+    
+
+def toggle_modem_power(status):
+    GPIO.output(MODEM_POWER_PIN, not bool(status))
+
+
+def generate_thumbnails(video_output_path, thumbnails_temp_path):
+    try:
+        cap = cv2.VideoCapture(video_output_path)
 
         frames_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frames_per_col = int(math.sqrt(config["camera"]["video_thumbnails_num"]))
-        frames_per_thumbnail = int(frames_total/config["camera"]["video_thumbnails_num"])
+        frames_per_col = int(math.sqrt(VIDEO_THUMBNAILS_NUM))
+        frames_per_thumbnail = int(frames_total/VIDEO_THUMBNAILS_NUM)
 
-        w, h = tuple(config["camera"]["preview_res"])
-        video_thumbnails_image = Image.new("RGBA", (w*frames_per_col, h*frames_per_col), 255)
+        w, h = VIDEO_RESOLUTION
+        thumbnails_image = Image.new("RGBA", (w*frames_per_col, h*frames_per_col), 255)
 
         cur, row, col = 0, 0, 0
 
-        for i in range(config["camera"]["video_thumbnails_num"]):
+        for i in range(VIDEO_THUMBNAILS_NUM):
             cap.set(1, cur)
             ret, frame = cap.read()
 
-            video_thumbnails_image.paste(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), (w*col, h*row))
+            thumbnails_image.paste(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), (w*col, h*row))
 
             cur += frames_per_thumbnail
 
@@ -108,228 +225,192 @@ def generate_video_thumbnails(video_path, video_thumbnails_path):
 
         cap.release()
 
-        video_thumbnails_image.convert("RGB").save(video_thumbnails_path)
-
-        video_thumbnails_generated = True
+        thumbnails_image.convert("RGB").resize(VIDEO_PREVIEW_RESOLUTION, Image.ANTIALIAS).save(thumbnails_temp_path.name, format="JPEG", quality=THUMBNAILS_QUALITY)
     except Exception as e:
-        logging.error(e)
-        pass
+        logger.error(e)
+        return False
 
-    return video_thumbnails_generated
-
-
-def capture_photo(photo_path):
-    photo_captured = False
-
-    camera.resolution = tuple(config["camera"]["photo_res"])
-    camera.annotate_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    camera.annotate_text_size = 40
-
-    try:
-        camera.capture(photo_path)
-
-        photo_captured = True
-    except Exception as e:
-        logging.error(e)
-        pass
-
-    return photo_captured
+    return True
 
 
-def capture_video(video_path):
-    video_captured = False
-    video_tmp_path = os.path.join("/tmp", f"{os.path.splitext(os.path.basename(video_path))[0]}.h264")
-
-    camera.resolution = tuple(config["camera"]["preview_res"])
-    camera.annotate_text_size = 16
-    camera.annotate_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    try:
-        camera.start_recording(video_tmp_path, format="h264", quality=23)
-        start_time = datetime.datetime.now()
-
-        while (datetime.datetime.now()-start_time).total_seconds() < config["camera"]["video_max_length"]:
-            if int((datetime.datetime.now()-start_time).total_seconds()) % 5 == 0 and GPIO.input(config["gpio"]["motion_sensor_pin"]) == 0:
-                break
-
-            camera.annotate_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            camera.wait_recording(1)
-
-        camera.stop_recording()
-
-        if subprocess.call([config["base"]["ffmpeg_path"], "-i", video_tmp_path, "-c", "copy", video_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
-            video_captured = True
-    except Exception as e:
-        logging.error(e)
-        pass
-
-    try:
-        os.remove(video_tmp_path)
-    except Exception as e:
-        pass
-
-    return video_captured
-
-
-def send_mail(previews):
+def send_mail(thumbnails_temp_path, thumbnails_filename):
     mail_sent = False
     smtp_connected = False
+    smtp_ready = False
 
     message = MIMEMultipart()
-    message["From"] = config["smtp"]["from"]
-    message["To"] = config["smtp"]["to"]
-    message["Subject"] = "PiCam Triggered!"
+    message["From"] = Header(SMTP_FROM)
+    message["To"] = Header(SMTP_RCPT)
+    message["Subject"] = Header("PiCam Triggered!")
 
-    if not bool(GPIO.input(config["gpio"]["low_battery_pin"])):
-        message.attach(MIMEText("LOW BATTERY!", "plain"))
-
-    for preview in previews:
-        try:
-            preview_buf = BytesIO()
-            Image.open(preview).resize(tuple(config["camera"]["preview_res"]), Image.ANTIALIAS).save(preview_buf, format="JPEG")
-
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(preview_buf.getvalue())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(preview)}")
-            message.attach(part)
-        except Exception as e:
-            logging.error(e)
-            pass
-        finally:
-            preview_buf.close()
+    message.attach(MIMEText(f"{log_stats()}\n\n", "plain", "utf-8"))
 
     try:
-        server = smtplib.SMTP(config["smtp"]["server"], config["smtp"]["port"])
+        attachment = MIMEApplication(thumbnails_temp_path.read(), _subtype="jpg")
+        attachment.add_header("Content-Disposition", "attachment", filename=thumbnails_filename)
+
+        message.attach(attachment)
+    except Exception as e:
+        logger.error(e)
+        pass
+
+    try:
+        server = smtplib.SMTP(host=SMTP_SERVER, port=SMTP_PORT, timeout=SMTP_TIMEOUT)
         smtp_connected = True
     except Exception as e:
-        logging.error(e)
+        logger.error(e)
         pass
 
     if smtp_connected:
-        try:
-            if config["smtp"]["starttls"]:
-                server.starttls(context=ssl.create_default_context())
-
+        if SMTP_STARTTLS:
             try:
-                server.login(config["smtp"]["username"], config["smtp"]["password"])
+                server.starttls(context=ssl.create_default_context())
+                smtp_ready = True
             except Exception as e:
+                logger.debug(e)
                 pass
 
-            server.sendmail(config["smtp"]["from"], config["smtp"]["to"], message.as_string())
+        if smtp_ready:
+            try:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            except Exception as e:
+                logger.debug(e)
+                pass
 
-            mail_sent = True
-        except Exception as e:
-            logging.error(e)
-            pass
-        finally:
+            try:
+                server.sendmail(SMTP_FROM, SMTP_RCPT, message.as_string())
+                mail_sent = True
+            except Exception as e:
+                logger.error(e)
+                pass
+
+        try:
             server.quit()
+        except:
+            pass
 
     return mail_sent
 
 
-def modem_trigger_action(power_status):
-    if power_status != GPIO.input(config["gpio"]["modem_power_status_pin"]):
-        while power_status != GPIO.input(config["gpio"]["modem_power_status_pin"]):
-            GPIO.output(config["gpio"]["modem_power_trigger_pin"], GPIO.HIGH)
-            time.sleep(2)
-            GPIO.output(config["gpio"]["modem_power_trigger_pin"], GPIO.LOW)
-            time.sleep(2)
-
-            if power_status == GPIO.input(config["gpio"]["modem_power_status_pin"]):
-                break
-
-        time.sleep(2)
-
-
 def motion_trigger_action(channel, force=False):
-    logging.info("Motion Sensor triggered!")
+    trigger_start_time = time.time()
+
+    global last_motion_time
+    global false_alarm_count
+    global motion_count
 
     if GPIO.input(channel) == 0 and force is False:
-        logging.debug("False Alarm!")
         return
-    else:
-        logging.info(f"Capturing Photo...")
 
-        GPIO.output(config["gpio"]["ir_led_pin"], GPIO.HIGH)
-        time.sleep(2)
+    logger.info("Motion Sensor triggered!")
 
-        previews = []
-        photo_path = os.path.join(config["base"]["data_dir"], f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.jpg")
+    GPIO.output(IR_LED_PIN, GPIO.HIGH)
 
-        if capture_photo(photo_path):
-            logging.debug(f"Photo Captured: {photo_path}")
-            previews.append(photo_path)
+    video_output_path = os.path.join(DATA_DIR, f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.mp4")
+    first_motion_time = time.time()
+    last_motion_time = first_motion_time
+    motion_count = 1
+    false_alarm = False
 
-        time.sleep(2)
+    logger.debug("Capturing Video...")
 
-        video_captured = False
+    with tempfile.NamedTemporaryFile() as video_temp_path:
+        with picamera.PiCamera() as camera:
+            with DetectMotion(camera) as output:
+                camera.rotation = CAMERA_ROTATION
+                camera.color_effects = (128, 128)
+                camera.resolution = VIDEO_RESOLUTION
+                camera.framerate = VIDEO_FRAMERATE
+                camera.start_recording(video_temp_path, format="h264", motion_output=output)
 
-        if GPIO.input(channel) == 1:
-            logging.info(f"Capturing Video...")
-            video_path = os.path.join(config["base"]["data_dir"], f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.mp4")
-            video_captured = capture_video(video_path)
+                camera.annotate_background = picamera.Color("black")
+                camera.annotate_foreground = picamera.Color("white")
+                camera.annotate_text_size = 16
 
-        GPIO.output(config["gpio"]["ir_led_pin"], GPIO.LOW)
+                while int(time.time() - first_motion_time) < VIDEO_MAX_LENGTH:
+                    if (time.time() - first_motion_time) >= MOTION_THRESHOLD_TIME and motion_count < MOTION_THRESHOLD_COUNT:
+                        false_alarm = True
+                        break
 
-        if video_captured:
-            logging.debug(f"Video Captured: {video_path}")
+                    camera.annotate_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    camera.wait_recording(1)
+                
+                camera.stop_recording()
 
-            logging.info(f"Generating Video Thumbnails...")
-            video_thumbnails_generated = False
-            video_thumbnails_path = os.path.join("/tmp", f"{os.path.splitext(os.path.basename(video_path))[0]}.jpg")
+        GPIO.output(IR_LED_PIN, GPIO.LOW)
 
-            if generate_video_thumbnails(video_path, video_thumbnails_path):
-                logging.debug(f"Video Thumbnails Generated: {video_thumbnails_path}")
-                previews.append(video_thumbnails_path)
+        if force is False and false_alarm is True:
+            logger.error("False Alarm!")
+            false_alarm_count += 1
 
-        if len(previews) > 0:
-            logging.info("Starting Modem...")
-            modem_trigger_action(1)
+            if false_alarm_count == THROTTLE_THRESHOLD:
+                logger.warning(f"Too many false alarms ({THROTTLE_THRESHOLD})! Throttling for {THROTTLE_DELAY} seconds")
 
-            logging.info("Connecting PPP...")
+                time.sleep(THROTTLE_DELAY)
+                false_alarm_count = 0
+
+            return
+
+        false_alarm_count = 0
+
+        logger.debug(f"Converting Video...")
+
+        try:
+            subprocess.check_output([FFMPEG_PATH, "-i", video_temp_path.name, "-c", "copy", video_output_path], stderr=subprocess.DEVNULL)
+        except:
+            logger.error("Video Error!")
+            return
+
+    logger.debug(f"Generating Thumbnails...")
+
+    with tempfile.NamedTemporaryFile() as thumbnails_temp_path:
+        if generate_thumbnails(video_output_path, thumbnails_temp_path):
+            logger.debug("Connecting PPP...")
+
+            toggle_modem_power(1)
+
             ppp = PPP()
             ppp.connect()
-
+        
             if ppp.connected:
-                logging.info("Sending Preview...")
+                logger.debug("Sending Preview...")
 
-                if send_mail(previews) is False:
-                    logging.error("SMTP Error! Mail not sent!")
+                if send_mail(thumbnails_temp_path, f"{Path(video_output_path).stem}.jpg") is False:
+                    logger.error("SMTP Error! Mail not sent!")
+                else:
+                    logger.debug("Mail sent successfully!")
             else:
-                logging.error("PPP Connection Error!")
+                logger.error("PPP Connection Error!")
 
             ppp.disconnect()
 
-            logging.info("Stopping Modem...")
-            modem_trigger_action(0)
+            toggle_modem_power(0)
 
-            logging.info("Done!")
+    trigger_end_time = int(time.time() - trigger_start_time)
 
-        logging.debug(f"Sleeping for {config['base']['wait_time']} seconds...")
-        time.sleep(config["base"]["wait_time"])
-        logging.debug("Ready!")
+    logger.debug(f"Trigger Runtime: {trigger_end_time} seconds")
+    logger.debug(log_stats())
+    logger.info("Ready!")
 
 
 if __name__ == "__main__":
-    if sys.stdout.isatty():
-        logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.DEBUG)
-    else:
-        logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO, handlers=[logging.FileHandler(os.path.join(config["base"]["data_dir"], "picam.log"))])
-
-    logging.info("Ready!")
-    
-    motion_trigger_action(config["gpio"]["motion_sensor_pin"], force=True)
-
     try:
-        GPIO.add_event_detect(config["gpio"]["motion_sensor_pin"], GPIO.RISING, callback=motion_trigger_action)
+        signal.signal(signal.SIGTERM, graceful_exit)
+
+        for i in range(10):
+            GPIO.output(IR_LED_PIN, i%2)
+            time.sleep(0.5)
+
+        GPIO.output(IR_LED_PIN, GPIO.LOW)
+
+        logger.debug(log_stats())
+        logger.info("Ready!")
+        
+        motion_trigger_action(MOTION_SENSOR_PIN, force=True)
+
+        GPIO.add_event_detect(MOTION_SENSOR_PIN, GPIO.RISING, callback=motion_trigger_action)
 
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
-        logging.info("Exiting...")
-
-        GPIO.output(config["gpio"]["ir_led_pin"], GPIO.LOW)
-        camera.close()
-        modem_trigger_action(0)
-        GPIO.cleanup()
+        graceful_exit()
