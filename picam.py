@@ -17,7 +17,6 @@ from pathlib import Path
 from spidev import SpiDev
 import RPi.GPIO as GPIO
 import cv2
-import datetime
 import logging
 import logging.handlers
 import math
@@ -39,6 +38,7 @@ from config import *
 """ Logging Setup """
 logger = logging.getLogger("picam")
 logger.setLevel(logging.DEBUG)
+logger.propagate = False
 
 if sys.stdout.isatty():
     logging.getLogger("PIL").setLevel(logging.CRITICAL+1)
@@ -242,7 +242,6 @@ def send_mail(thumbnails_temp_path, thumbnails_filename):
     message["From"] = Header(SMTP_FROM)
     message["To"] = Header(SMTP_RCPT)
     message["Subject"] = Header("PiCam Triggered!")
-
     message.attach(MIMEText(f"{log_stats()}\n\n", "plain", "utf-8"))
 
     try:
@@ -252,14 +251,13 @@ def send_mail(thumbnails_temp_path, thumbnails_filename):
         message.attach(attachment)
     except Exception as e:
         logger.error(e)
-        pass
 
     try:
         server = smtplib.SMTP(host=SMTP_SERVER, port=SMTP_PORT, timeout=SMTP_TIMEOUT)
+        # server.set_debuglevel(1)
         smtp_connected = True
     except Exception as e:
         logger.error(e)
-        pass
 
     if smtp_connected:
         if SMTP_STARTTLS:
@@ -268,21 +266,18 @@ def send_mail(thumbnails_temp_path, thumbnails_filename):
                 smtp_ready = True
             except Exception as e:
                 logger.debug(e)
-                pass
 
         if smtp_ready:
             try:
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
             except Exception as e:
                 logger.debug(e)
-                pass
 
             try:
                 server.sendmail(SMTP_FROM, SMTP_RCPT, message.as_string())
                 mail_sent = True
             except Exception as e:
                 logger.error(e)
-                pass
 
         try:
             server.quit()
@@ -294,6 +289,7 @@ def send_mail(thumbnails_temp_path, thumbnails_filename):
 
 def motion_trigger_action(channel, force=False):
     trigger_start_time = time.time()
+    filename_timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime(trigger_start_time))
 
     global last_motion_time
     global false_alarm_count
@@ -306,85 +302,107 @@ def motion_trigger_action(channel, force=False):
 
     GPIO.output(IR_LED_PIN, GPIO.HIGH)
 
-    video_output_path = os.path.join(DATA_DIR, f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.mp4")
-    first_motion_time = time.time()
-    last_motion_time = first_motion_time
-    motion_count = 1
-    false_alarm = False
+    logger.debug("Capturing Photo...")
+
+    try:
+        photo_output_path = os.path.join(DATA_DIR, f"{filename_timestamp}.jpg")
+
+        with picamera.PiCamera() as camera:
+            camera.rotation = CAMERA_ROTATION
+            camera.color_effects = (128, 128)
+            camera.resolution = PHOTO_RESOLUTION
+            camera.annotate_background = picamera.Color("black")
+            camera.annotate_foreground = picamera.Color("white")
+            camera.annotate_text_size = 40
+            camera.annotate_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            camera.capture(photo_output_path)
+    except Exception as e:
+        logger.error(f"Something went wrong :( ({e})")
 
     logger.debug("Capturing Video...")
 
-    with tempfile.NamedTemporaryFile() as video_temp_path:
-        with picamera.PiCamera() as camera:
-            with DetectMotion(camera) as output:
-                camera.rotation = CAMERA_ROTATION
-                camera.color_effects = (128, 128)
-                camera.resolution = VIDEO_RESOLUTION
-                camera.framerate = VIDEO_FRAMERATE
-                camera.start_recording(video_temp_path, format="h264", motion_output=output)
+    try:
+        video_output_path = os.path.join(DATA_DIR, f"{filename_timestamp}.mp4")
+        capture_start_timee = time.time()
+        last_motion_time = capture_start_timee
+        motion_count = 1
+        false_alarm = False
 
-                camera.annotate_background = picamera.Color("black")
-                camera.annotate_foreground = picamera.Color("white")
-                camera.annotate_text_size = 16
+        with tempfile.NamedTemporaryFile() as video_temp_path:
+            with picamera.PiCamera() as camera:
+                with DetectMotion(camera) as output:
+                    camera.rotation = CAMERA_ROTATION
+                    camera.color_effects = (128, 128)
+                    camera.resolution = VIDEO_RESOLUTION
+                    camera.framerate = VIDEO_FRAMERATE
+                    camera.start_recording(video_temp_path, format="h264", motion_output=output)
 
-                while int(time.time() - first_motion_time) < VIDEO_MAX_LENGTH:
-                    if (time.time() - first_motion_time) >= MOTION_THRESHOLD_TIME and motion_count < MOTION_THRESHOLD_COUNT:
-                        false_alarm = True
-                        break
+                    camera.annotate_background = picamera.Color("black")
+                    camera.annotate_foreground = picamera.Color("white")
+                    camera.annotate_text_size = 16
 
-                    camera.annotate_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    camera.wait_recording(1)
-                
-                camera.stop_recording()
+                    while int(time.time() - capture_start_timee) < VIDEO_MAX_LENGTH:
+                        if (time.time() - capture_start_timee) >= MOTION_THRESHOLD_TIME and motion_count < MOTION_THRESHOLD_COUNT:
+                            false_alarm = True
+                            break
 
-        GPIO.output(IR_LED_PIN, GPIO.LOW)
+                        camera.annotate_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                        camera.wait_recording(1)
+                    
+                    camera.stop_recording()
 
-        if force is False and false_alarm is True:
-            logger.error("False Alarm!")
-            false_alarm_count += 1
+            GPIO.output(IR_LED_PIN, GPIO.LOW)
 
-            if false_alarm_count == THROTTLE_THRESHOLD:
-                logger.warning(f"Too many false alarms ({THROTTLE_THRESHOLD})! Throttling for {THROTTLE_DELAY} seconds")
+            if force is False and false_alarm is True:
+                logger.error("False Alarm!")
+                false_alarm_count += 1
 
-                time.sleep(THROTTLE_DELAY)
-                false_alarm_count = 0
+                if false_alarm_count == THROTTLE_THRESHOLD:
+                    logger.warning(f"Too many false alarms ({THROTTLE_THRESHOLD})! Throttling for {THROTTLE_DELAY} seconds")
 
-            return
+                    time.sleep(THROTTLE_DELAY)
+                    false_alarm_count = 0
 
-        false_alarm_count = 0
+                return
 
-        logger.debug(f"Converting Video...")
+            false_alarm_count = 0
 
-        try:
-            subprocess.check_output([FFMPEG_PATH, "-i", video_temp_path.name, "-c", "copy", video_output_path], stderr=subprocess.DEVNULL)
-        except:
-            logger.error("Video Error!")
-            return
+            logger.debug(f"Converting Video...")
 
-    logger.debug(f"Generating Thumbnails...")
+            try:
+                subprocess.check_output([FFMPEG_PATH, "-i", video_temp_path.name, "-c", "copy", video_output_path], stderr=subprocess.DEVNULL)
+            except:
+                logger.error("Video Error!")
+                return
 
-    with tempfile.NamedTemporaryFile() as thumbnails_temp_path:
-        if generate_thumbnails(video_output_path, thumbnails_temp_path):
-            logger.debug("Connecting PPP...")
+        logger.debug(f"Generating Thumbnails...")
 
-            toggle_modem_power(1)
+        with tempfile.NamedTemporaryFile() as thumbnails_temp_path:
+            if generate_thumbnails(video_output_path, thumbnails_temp_path):
+                logger.debug("Connecting PPP...")
 
-            ppp = PPP()
-            ppp.connect()
-        
-            if ppp.connected:
-                logger.debug("Sending Preview...")
+                toggle_modem_power(1)
 
-                if send_mail(thumbnails_temp_path, f"{Path(video_output_path).stem}.jpg") is False:
-                    logger.error("SMTP Error! Mail not sent!")
+                ppp = PPP()
+                ppp.connect()
+            
+                if ppp.connected:
+                    logger.debug("Sending Preview...")
+
+                    if send_mail(thumbnails_temp_path, f"{Path(video_output_path).stem}.jpg") is False:
+                        logger.error("SMTP Error! Mail not sent!")
+                    else:
+                        logger.debug("Mail sent successfully!")
                 else:
-                    logger.debug("Mail sent successfully!")
-            else:
-                logger.error("PPP Connection Error!")
+                    logger.error("PPP Connection Error!")
 
-            ppp.disconnect()
+                ppp.disconnect()
 
-            toggle_modem_power(0)
+                toggle_modem_power(0)
+    except Exception as e:
+        logger.error(f"Something went wrong :( ({e})")
+    finally:
+        GPIO.output(IR_LED_PIN, GPIO.LOW)
 
     trigger_end_time = int(time.time() - trigger_start_time)
 
